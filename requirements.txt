@@ -1,5 +1,6 @@
 fastapi
-uvicorn
-feedparser
 transformers
-torch
+uvicorn[standard]
+feedparser
+python-dotenv
+
