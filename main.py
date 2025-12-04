@@ -1,11 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
-import feedparser
+from typing import List, Dict, Any
 from datetime import datetime, timezone
 import time
 import re
+import asyncio
+import feedparser
+import httpx
 
 class NewsItem(BaseModel):
     headline: str
@@ -16,8 +18,8 @@ class NewsItem(BaseModel):
 
 app = FastAPI(
     title="Fineryx News Backend",
-    version="2.0.0",
-    description="Aggregated finance headlines from multiple legal RSS sources."
+    version="3.0.0",
+    description="Aggregated finance headlines from multiple legal RSS sources (async + cached)."
 )
 
 app.add_middleware(
@@ -29,61 +31,63 @@ app.add_middleware(
 )
 
 # 15 OFFICIAL, PUBLIC, LEGAL RSS FEEDS
-RSS_FEEDS = [
-
+RSS_FEEDS: List[Dict[str, str]] = [
     # INDIA
-    {"name": "Moneycontrol", 
+    {"name": "Moneycontrol",
      "url": "http://www.moneycontrol.com/rss/latestnews.xml"},
 
-    {"name": "Economic Times", 
+    {"name": "Economic Times",
      "url": "https://economictimes.indiatimes.com/rssfeedsdefault.cms"},
 
-    {"name": "BusinessLine", 
+    {"name": "BusinessLine",
      "url": "https://www.thehindubusinessline.com/feeder/default.rss"},
 
-    {"name": "Business Standard", 
+    {"name": "Business Standard",
      "url": "https://www.business-standard.com/rss/latest.rss"},
 
-    {"name": "LiveMint Companies", 
+    {"name": "LiveMint Companies",
      "url": "https://www.livemint.com/rss/companies"},
 
-    {"name": "Zee Business", 
+    {"name": "Zee Business",
      "url": "https://www.zeebiz.com/latest.xml"},
 
-    {"name": "NDTV Business", 
+    {"name": "NDTV Business",
      "url": "https://feeds.feedburner.com/ndtvprofit-latest"},
 
-    {"name": "Hindustan Times Business", 
+    {"name": "Hindustan Times Business",
      "url": "https://www.hindustantimes.com/feeds/rss/business/rssfeed.xml"},
 
     # GLOBAL
-    {"name": "BBC Business", 
+    {"name": "BBC Business",
      "url": "http://feeds.bbci.co.uk/news/business/rss.xml"},
 
-    {"name": "Reuters Business", 
+    {"name": "Reuters Business",
      "url": "http://feeds.reuters.com/reuters/businessNews"},
 
-    {"name": "CNBC", 
+    {"name": "CNBC",
      "url": "https://www.cnbc.com/id/10001147/device/rss/rss.html"},
 
-    {"name": "MarketWatch", 
+    {"name": "MarketWatch",
      "url": "https://www.marketwatch.com/rss/topstories"},
 
-    {"name": "Yahoo Finance", 
+    {"name": "Yahoo Finance",
      "url": "https://feeds.finance.yahoo.com/rss/2.0/headline?s=yhoo&region=US&lang=en-US"},
 
-    {"name": "CNN Money", 
+    {"name": "CNN Money",
      "url": "http://rss.cnn.com/rss/money_latest.rss"},
 
-    {"name": "Al Jazeera Business", 
+    {"name": "Al Jazeera Business",
      "url": "https://www.aljazeera.com/xml/rss/all.xml"},
 ]
 
-NEWS_CACHE = {"items": [], "timestamp": 0.0}
+# In-memory cache
+NEWS_CACHE: Dict[str, Any] = {"items": [], "timestamp": 0.0}
 CACHE_TTL_SECONDS = 300  # 5 mins cache
+FEED_TIMEOUT_SECONDS = 8.0  # per-feed HTTP timeout
+MAX_ITEMS = 250  # max total news items returned
 
 
-def _to_iso(struct):
+def _to_iso(struct) -> str | None:
     if not struct:
         return None
     try:
@@ -93,11 +97,11 @@ def _to_iso(struct):
             tzinfo=timezone.utc
         )
         return dt.isoformat()
-    except:
+    except Exception:
         return None
 
 
-def _clean(text):
+def _clean(text: str) -> str:
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", " ", text)
@@ -107,30 +111,27 @@ def _clean(text):
     return text
 
 
-def fetch_news(force=False):
-    now = time.time()
+async def _fetch_single_feed(client: httpx.AsyncClient, feed: Dict[str, str]) -> list[Dict[str, Any]]:
+    """Fetch and parse one RSS feed with timeout + bozo check."""
+    name = feed["name"]
+    url = feed["url"]
+    items: list[Dict[str, Any]] = []
 
-    if (not force 
-        and NEWS_CACHE["items"] 
-        and now - NEWS_CACHE["timestamp"] < CACHE_TTL_SECONDS):
-        return NEWS_CACHE["items"]
+    try:
+        resp = await client.get(url, timeout=FEED_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        parsed = feedparser.parse(resp.text)
 
-    all_items = []
-    seen = set()
-
-    for feed in RSS_FEEDS:
-        parsed = feedparser.parse(feed["url"])
         if parsed.bozo:
-            continue
+            # malformed feed, skip
+            return []
 
         for entry in parsed.entries:
             title = (entry.get("title") or "").strip()
             link = (entry.get("link") or "").strip()
 
-            if not title or not link or link in seen:
+            if not title or not link:
                 continue
-
-            seen.add(link)
 
             summary = _clean(entry.get("summary") or entry.get("description") or "")
             published = None
@@ -142,21 +143,65 @@ def fetch_news(force=False):
             else:
                 published = datetime.now(timezone.utc).isoformat()
 
-            all_items.append({
+            items.append({
                 "headline": title,
                 "summary": summary,
                 "url": link,
-                "source": feed["name"],
+                "source": name,
                 "published_at": published
             })
 
+        return items
+
+    except Exception as e:
+        # Log error in server logs, but don't break the whole aggregator
+        print(f"[FEED ERROR] {name}: {e}")
+        return []
+
+
+async def fetch_news(force: bool = False) -> list[Dict[str, Any]]:
+    """Fetch aggregated news with caching + async RSS fetch."""
+    now = time.time()
+
+    # Serve from cache if still fresh
+    if (not force
+        and NEWS_CACHE["items"]
+        and now - NEWS_CACHE["timestamp"] < CACHE_TTL_SECONDS):
+        return NEWS_CACHE["items"]
+
+    all_items: list[Dict[str, Any]] = []
+    seen_links: set[str] = set()
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        tasks = [
+            _fetch_single_feed(client, feed)
+            for feed in RSS_FEEDS
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Flatten & dedupe
+    for result in results:
+        if isinstance(result, Exception):
+            # already logged inside _fetch_single_feed
+            continue
+        for item in result:
+            link = item.get("url")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            all_items.append(item)
+
+    # Sort newest first
     all_items.sort(key=lambda x: x["published_at"], reverse=True)
 
-    if len(all_items) > 250:
-        all_items = all_items[:250]
+    # Limit total count
+    if len(all_items) > MAX_ITEMS:
+        all_items = all_items[:MAX_ITEMS]
 
+    # Update cache
     NEWS_CACHE["items"] = all_items
     NEWS_CACHE["timestamp"] = now
+
     return all_items
 
 
@@ -165,23 +210,32 @@ def root():
     return {
         "message": "Fineryx News API Live 🌐",
         "sources": len(RSS_FEEDS),
-        "info": "Use /news to get aggregated headlines."
+        "info": "Use /news to get aggregated headlines.",
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
     }
 
 
 @app.get("/news")
-def get_news(limit: int = 0):
-    items = fetch_news()
+async def get_news(limit: int = 0, force: bool = False):
+    """
+    Get aggregated news.
+    - limit: optional max number of items to return (0 = no extra limit)
+    - force: if true, bypass cache and refetch (use carefully)
+    """
+    items = await fetch_news(force=force)
+
     if limit > 0:
         items = items[:limit]
+
     return {"count": len(items), "items": items}
 
 
 @app.get("/health")
 def health():
+    """Lightweight health endpoint for uptime checks."""
     return {
         "status": "ok",
         "sources": len(RSS_FEEDS),
         "cached_items": len(NEWS_CACHE["items"]),
+        "cache_age_seconds": time.time() - NEWS_CACHE["timestamp"] if NEWS_CACHE["timestamp"] else None,
     }
-
