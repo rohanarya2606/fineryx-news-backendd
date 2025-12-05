@@ -239,3 +239,4 @@ def health():
         "cached_items": len(NEWS_CACHE["items"]),
         "cache_age_seconds": time.time() - NEWS_CACHE["timestamp"] if NEWS_CACHE["timestamp"] else None,
     }
+
